@@ -1,0 +1,41 @@
+[package]
+name = "jinfu-search"
+version = "0.1.0"
+edition = "2024"
+description = "Windows-first, low-resource local file search for people and agents"
+license = "MIT"
+
+[features]
+default = ["tray"]
+tray = ["dep:tao", "dep:tray-icon"]
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+rusqlite = { version = "0.38", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tao = { version = "0.34", optional = true }
+thiserror = "2"
+tokio = { version = "1.53", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tray-icon = { version = "0.24", optional = true }
+unicode-normalization = "0.1"
+walkdir = "2.5"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[dev-dependencies]
+tempfile = "3"
