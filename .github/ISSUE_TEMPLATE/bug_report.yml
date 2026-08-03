@@ -1,0 +1,34 @@
+name: Bug 报告
+description: 报告可复现的搜索、索引、界面或 MCP 问题
+title: "[Bug] "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: 请勿粘贴真实敏感路径、凭据或索引数据库。
+  - type: input
+    id: version
+    attributes:
+      label: 版本
+      placeholder: v0.3.0
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows 与磁盘文件系统
+      placeholder: Windows 11 24H2，C: NTFS / E: exFAT
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: 复现步骤
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 预期结果与实际结果
+    validations:
+      required: true

@@ -24,15 +24,21 @@ use windows_sys::Win32::{
         IO::DeviceIoControl,
         Ioctl::{
             FSCTL_ENUM_USN_DATA, FSCTL_QUERY_USN_JOURNAL, FSCTL_READ_USN_JOURNAL,
-            USN_REASON_FILE_DELETE,
+            USN_REASON_FILE_CREATE, USN_REASON_FILE_DELETE, USN_REASON_RENAME_NEW_NAME,
+            USN_REASON_RENAME_OLD_NAME,
         },
     },
 };
 
 pub const ROOT_FILE_REFERENCE: u64 = 5;
 const FILE_REFERENCE_NUMBER_MASK: u64 = (1_u64 << 48) - 1;
-const JOURNAL_BUFFER_BYTES: usize = 64 * 1024;
-const MAX_JOURNAL_BATCHES_PER_SYNC: usize = 128;
+const JOURNAL_BUFFER_BYTES: usize = 16 * 1024;
+// 将高写入期的积压切成 16 KiB 小块，避免一个卷长时间占住唯一维护线程。
+const MAX_JOURNAL_BATCHES_PER_SYNC: usize = 1;
+const INDEX_RELEVANT_REASON_MASK: u32 = USN_REASON_FILE_CREATE
+    | USN_REASON_FILE_DELETE
+    | USN_REASON_RENAME_OLD_NAME
+    | USN_REASON_RENAME_NEW_NAME;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum NtfsError {
@@ -167,7 +173,9 @@ pub fn read_journal_since(
 
     let mut request = ReadUsnJournalDataV0 {
         start_usn,
-        reason_mask: u32::MAX,
+        // 文件名索引只关心结构变化。排除 DATA_EXTEND/OVERWRITE 等正文写入事件，
+        // 避免索引数据库自身和大文件保存形成无意义的增量风暴。
+        reason_mask: INDEX_RELEVANT_REASON_MASK,
         return_only_on_close: 1,
         timeout: 0,
         bytes_to_wait_for: 0,

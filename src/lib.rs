@@ -4,6 +4,7 @@
 //! Agent 快速定位文件，也不会把私人文件内容复制到本地索引库中。
 
 use std::{
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
     sync::atomic::{AtomicI64, Ordering},
@@ -31,12 +32,20 @@ pub use pipe::{DEFAULT_PIPE_NAME, call_pipe, serve_pipe, serve_pipe_controlled};
 pub mod ntfs;
 
 #[cfg(windows)]
+pub mod maintenance;
+
+#[cfg(windows)]
+pub mod mcp;
+
+#[cfg(windows)]
 pub mod search_ui;
 
 #[cfg(all(windows, feature = "tray"))]
 pub mod tray;
 
 const MAX_QUERY_LIMIT: usize = 1_000;
+const MAX_QUERY_CHARS: usize = 512;
+const MAX_QUERY_TERMS: usize = 16;
 static LAST_GENERATION: AtomicI64 = AtomicI64::new(0);
 
 #[derive(Debug, Error)]
@@ -53,6 +62,10 @@ pub enum SearchError {
     NotDirectory(PathBuf),
     #[error("搜索词不能为空")]
     EmptyQuery,
+    #[error("搜索词不能超过 {MAX_QUERY_CHARS} 个字符")]
+    QueryTooLong,
+    #[error("搜索词不能超过 {MAX_QUERY_TERMS} 个空格分隔的相关词")]
+    TooManyQueryTerms,
 }
 
 pub type Result<T> = std::result::Result<T, SearchError>;
@@ -114,6 +127,14 @@ pub struct IndexedRoot {
     pub last_scan_unix_ms: i64,
     pub complete: bool,
     pub skipped_entries: u64,
+    pub uses_ntfs_usn: bool,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AutoVolumeState {
+    pub root: String,
+    pub last_reconcile_unix_ms: i64,
     pub uses_ntfs_usn: bool,
 }
 
@@ -267,12 +288,18 @@ impl SearchIndex {
     }
 
     pub fn search(&self, request: &SearchRequest) -> Result<Vec<SearchItem>> {
+        if request.query.chars().count() > MAX_QUERY_CHARS {
+            return Err(SearchError::QueryTooLong);
+        }
         let query = normalize_for_search(&request.query);
         if query.is_empty() {
             return Err(SearchError::EmptyQuery);
         }
         let limit = request.limit.clamp(1, MAX_QUERY_LIMIT) as i64;
         let terms = query.split_whitespace().collect::<Vec<_>>();
+        if terms.len() > MAX_QUERY_TERMS {
+            return Err(SearchError::TooManyQueryTerms);
+        }
         let root = request
             .root
             .as_deref()
@@ -445,14 +472,16 @@ impl SearchIndex {
             }
         };
 
-        if delta.records.is_empty() {
+        let records = coalesce_ntfs_records(delta.records);
+        if records.is_empty() {
             self.update_ntfs_cursor(&root, delta.journal.journal_id, delta.next_usn)?;
             return self.report_for_root(&root, started).map(Some);
         }
 
-        if !self.apply_ntfs_delta(&root, delta.journal, delta.next_usn, delta.records)? {
-            return self.handle_ntfs_snapshot_required(&root, volume, allow_full_snapshot);
-        }
+        // 个别孤立父链保持根为“不完整”并推进游标，不让数百万条可靠路径
+        // 进入反复全盘重建；日志重置或游标缺失仍走完整快照。
+        let _fully_applied =
+            self.apply_ntfs_delta(&root, delta.journal, delta.next_usn, records)?;
         self.report_for_root(&root, started).map(Some)
     }
 
@@ -517,6 +546,186 @@ impl SearchIndex {
             .map_err(SearchError::from)
     }
 
+    /// 将 Windows 变更通知中的少量路径合并进一个已建立的目录/无日志卷索引。
+    /// 每个路径都在事务内替换对应子树；若通知丢失，后台低频整卷快照负责校准。
+    #[cfg(windows)]
+    pub fn refresh_changed_paths(
+        &self,
+        root: impl AsRef<Path>,
+        paths: &[PathBuf],
+    ) -> Result<usize> {
+        let root = root_for_lookup(root.as_ref())?;
+        let root_display = path_to_storage(&root);
+        let indexed = self
+            .indexed_roots()?
+            .into_iter()
+            .any(|candidate| candidate.root == root_display);
+        if !indexed {
+            return Err(SearchError::Io {
+                path: root,
+                source: std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "变更通知对应的索引根不存在",
+                ),
+            });
+        }
+
+        let mut selected = paths
+            .iter()
+            .filter_map(|path| {
+                path.strip_prefix(&root)
+                    .ok()
+                    .filter(|relative| !relative.as_os_str().is_empty())
+                    .map(|relative| (path.clone(), relative.to_path_buf()))
+            })
+            .collect::<Vec<_>>();
+        selected.sort_by_key(|(_, relative)| relative.components().count());
+        let mut collapsed: Vec<(PathBuf, PathBuf)> = Vec::new();
+        for candidate in selected {
+            if collapsed
+                .iter()
+                .any(|(_, parent)| candidate.1.starts_with(parent))
+            {
+                continue;
+            }
+            collapsed.push(candidate);
+        }
+
+        let generation = next_generation();
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let mut changed = 0usize;
+        for (path, relative) in collapsed {
+            let relative_storage = path_to_storage(&relative);
+            let prefix = format!("{}/%", escape_like(&relative_storage));
+            if !path.exists() {
+                changed += transaction.execute(
+                    "DELETE FROM entries
+                     WHERE root = ?1
+                       AND (relative_path = ?2 OR relative_path LIKE ?3 ESCAPE '\\')",
+                    params![&root_display, &relative_storage, &prefix],
+                )?;
+                continue;
+            }
+
+            let mut complete = true;
+            let mut entries = Vec::new();
+            let walker = WalkDir::new(&path).follow_links(false).into_iter();
+            for entry in walker {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(_) => {
+                        complete = false;
+                        continue;
+                    }
+                };
+                let relative = match entry.path().strip_prefix(&root) {
+                    Ok(relative) if !relative.as_os_str().is_empty() => relative,
+                    _ => continue,
+                };
+                let metadata = match fs::symlink_metadata(entry.path()) {
+                    Ok(metadata) => metadata,
+                    Err(_) => {
+                        complete = false;
+                        continue;
+                    }
+                };
+                entries.push((
+                    path_to_storage(relative),
+                    entry.file_name().to_string_lossy().into_owned(),
+                    metadata.is_dir(),
+                    metadata.len().min(i64::MAX as u64) as i64,
+                    metadata.modified().ok().and_then(system_time_to_ms),
+                ));
+            }
+
+            if !complete {
+                return Err(SearchError::Io {
+                    path,
+                    source: std::io::Error::other(
+                        "无法完整读取变更子树，已放弃局部更新并请求完整校准",
+                    ),
+                });
+            }
+
+            for (relative_path, name, is_directory, size_bytes, modified_unix_ms) in &entries {
+                transaction.execute(
+                    "INSERT INTO entries (
+                        root, relative_path, name, normalized_name, normalized_path,
+                        is_directory, size_bytes, modified_unix_ms, generation,
+                        file_reference_number
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL)
+                     ON CONFLICT(root, relative_path) DO UPDATE SET
+                        name = excluded.name,
+                        normalized_name = excluded.normalized_name,
+                        normalized_path = excluded.normalized_path,
+                        is_directory = excluded.is_directory,
+                        size_bytes = excluded.size_bytes,
+                        modified_unix_ms = excluded.modified_unix_ms,
+                        generation = excluded.generation,
+                        file_reference_number = NULL",
+                    params![
+                        &root_display,
+                        relative_path,
+                        name,
+                        normalize_for_search(name),
+                        normalize_for_search(relative_path),
+                        i64::from(*is_directory),
+                        size_bytes,
+                        modified_unix_ms,
+                        generation,
+                    ],
+                )?;
+            }
+            changed += entries.len();
+            transaction.execute(
+                "DELETE FROM entries
+                 WHERE root = ?1
+                   AND (relative_path = ?2 OR relative_path LIKE ?3 ESCAPE '\\')
+                   AND generation <> ?4",
+                params![&root_display, &relative_storage, &prefix, generation],
+            )?;
+        }
+        transaction.execute(
+            "UPDATE roots SET last_scan_unix_ms = ?2 WHERE root = ?1",
+            params![&root_display, current_unix_ms()],
+        )?;
+        transaction.commit()?;
+        Ok(changed)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn auto_volume_states(&self) -> Result<Vec<AutoVolumeState>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT root, last_reconcile_unix_ms, uses_ntfs_usn
+             FROM auto_volume_state ORDER BY root",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(AutoVolumeState {
+                root: row.get(0)?,
+                last_reconcile_unix_ms: row.get(1)?,
+                uses_ntfs_usn: row.get::<_, i64>(2)? != 0,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(SearchError::from)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn record_auto_volume_state(&self, root: &str, uses_ntfs_usn: bool) -> Result<()> {
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT INTO auto_volume_state (root, last_reconcile_unix_ms, uses_ntfs_usn)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(root) DO UPDATE SET
+                last_reconcile_unix_ms = excluded.last_reconcile_unix_ms,
+                uses_ntfs_usn = excluded.uses_ntfs_usn",
+            params![root, current_unix_ms(), i64::from(uses_ntfs_usn)],
+        )?;
+        Ok(())
+    }
+
     pub fn remove_root(&self, root: impl AsRef<Path>) -> Result<bool> {
         let root = root_for_lookup(root.as_ref())?;
         let root_display = path_to_storage(&root);
@@ -527,7 +736,8 @@ impl SearchIndex {
     }
 
     /// 保存一次 MFT 快照。少量孤立记录不会让数百万条已解析路径整体不可用；
-    /// 但不完整快照不会建立 USN 增量游标，避免在缺失父链上猜测后续变更。
+    /// 已解析路径仍建立 USN 游标。若后续增量碰到缺失父链，整笔增量会回滚并
+    /// 请求完整校准，不会猜测路径。
     #[cfg(windows)]
     fn persist_ntfs_records(
         &self,
@@ -569,9 +779,9 @@ impl SearchIndex {
             params![&root, current_unix_ms()],
         )?;
 
-        transaction.execute("DELETE FROM entries WHERE root = ?1", [&root])?;
         transaction.execute("DELETE FROM ntfs_nodes WHERE root = ?1", [&root])?;
-        if complete && journal_id != 0 {
+        if journal_id != 0 {
+            transaction.execute("DELETE FROM entries WHERE root = ?1", [&root])?;
             for record in &records {
                 if let Some(path) = paths
                     .get(&record.file_reference_number)
@@ -582,19 +792,50 @@ impl SearchIndex {
                 }
             }
             Self::update_ntfs_cursor_in(&transaction, &root, journal_id, next_usn)?;
-        } else {
-            // 路径树不完整或卷没有活动日志时都只保留可搜索快照，不建立
-            // 增量游标；后者仍可由用户再次点击“更新本机索引”刷新。
-            transaction.execute("DELETE FROM ntfs_volume_state WHERE root = ?1", [&root])?;
-        }
-        for record in &records {
-            if let Some(path) = paths
-                .get(&record.file_reference_number)
-                .filter(|path| valid_ntfs_relative_path(path))
-            {
-                let node = ntfs_node_from_record(record, path.clone());
-                Self::upsert_ntfs_entry(&transaction, &root, &node, generation)?;
+            for record in &records {
+                if let Some(path) = paths
+                    .get(&record.file_reference_number)
+                    .filter(|path| valid_ntfs_relative_path(path))
+                {
+                    let node = ntfs_node_from_record(record, path.clone());
+                    Self::upsert_ntfs_entry(&transaction, &root, &node, generation)?;
+                }
             }
+        } else {
+            // 没有活动日志时只保留可搜索快照；后台文件事件负责即时维护，
+            // 并由低频 MFT 快照兜底校准。临时路径表让重复校准只写实际变化，
+            // 避免每次删除并重写数百万条未变化记录。
+            transaction.execute("DELETE FROM ntfs_volume_state WHERE root = ?1", [&root])?;
+            transaction.execute_batch(
+                "CREATE TEMP TABLE IF NOT EXISTS snapshot_seen (
+                     relative_path TEXT PRIMARY KEY NOT NULL
+                 ) WITHOUT ROWID;
+                 DELETE FROM snapshot_seen;",
+            )?;
+            for record in &records {
+                if let Some(path) = paths
+                    .get(&record.file_reference_number)
+                    .filter(|path| valid_ntfs_relative_path(path))
+                {
+                    let node = ntfs_node_from_record(record, path.clone());
+                    transaction
+                        .prepare_cached(
+                            "INSERT OR IGNORE INTO snapshot_seen (relative_path) VALUES (?1)",
+                        )?
+                        .execute([&node.relative_path])?;
+                    Self::upsert_snapshot_entry_if_changed(&transaction, &root, &node, generation)?;
+                }
+            }
+            transaction.execute(
+                "DELETE FROM entries
+                 WHERE root = ?1
+                   AND NOT EXISTS (
+                       SELECT 1 FROM snapshot_seen s
+                       WHERE s.relative_path = entries.relative_path
+                   )",
+                [&root],
+            )?;
+            transaction.execute_batch("DROP TABLE snapshot_seen;")?;
         }
 
         transaction.execute(
@@ -610,6 +851,14 @@ impl SearchIndex {
                 skipped_entries.min(i64::MAX as u64) as i64,
             ],
         )?;
+        transaction.execute(
+            "INSERT INTO auto_volume_state (root, last_reconcile_unix_ms, uses_ntfs_usn)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(root) DO UPDATE SET
+                last_reconcile_unix_ms = excluded.last_reconcile_unix_ms,
+                uses_ntfs_usn = excluded.uses_ntfs_usn",
+            params![&root, current_unix_ms(), i64::from(journal_id != 0)],
+        )?;
         transaction.commit()?;
 
         Ok(ScanReport {
@@ -622,8 +871,8 @@ impl SearchIndex {
         })
     }
 
-    /// 在一个事务内按 USN 顺序写入变更。若父节点、路径或重命名目标不能可靠
-    /// 判定，返回 `false`，由上层退回一次完整 MFT 快照。
+    /// 在一个事务内按 USN 顺序写入变更。若个别父节点或路径不能可靠判定，
+    /// 跳过该条并返回 `false`，但仍提交其他可靠变更和新游标。
     #[cfg(windows)]
     fn apply_ntfs_delta(
         &self,
@@ -637,25 +886,29 @@ impl SearchIndex {
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
 
+        let mut fully_applied = true;
         for record in &records {
             if record.file_reference_number == ntfs::ROOT_FILE_REFERENCE {
                 continue;
             }
             if !Self::apply_ntfs_delta_record(&transaction, root, record, generation)? {
-                // 未提交的事务会在离开作用域时回滚，避免部分变更污染索引。
-                return Ok(false);
+                fully_applied = false;
             }
         }
 
         Self::update_ntfs_cursor_in(&transaction, root, journal.journal_id, next_usn)?;
         transaction.execute(
             "UPDATE roots
-             SET last_scan_unix_ms = ?2, last_scan_complete = 1, skipped_entries = 0
+             SET last_scan_unix_ms = ?2,
+                 last_scan_complete = CASE
+                     WHEN ?3 = 1 AND skipped_entries = 0 THEN 1
+                     ELSE 0
+                 END
              WHERE root = ?1",
-            params![root, current_unix_ms()],
+            params![root, current_unix_ms(), i64::from(fully_applied)],
         )?;
         transaction.commit()?;
-        Ok(true)
+        Ok(fully_applied)
     }
 
     #[cfg(windows)]
@@ -704,14 +957,15 @@ impl SearchIndex {
 
         let record_reference = record.file_reference_number.to_string();
         let conflict = transaction
-            .query_row(
+            .prepare_cached(
                 "SELECT file_reference_number
                  FROM ntfs_nodes
                  WHERE root = ?1 AND relative_path = ?2 AND file_reference_number <> ?3
                  LIMIT 1",
-                params![root, &relative_path, &record_reference],
-                |row| row.get::<_, String>(0),
-            )
+            )?
+            .query_row(params![root, &relative_path, &record_reference], |row| {
+                row.get::<_, String>(0)
+            })
             .optional()?;
         if conflict.is_some() {
             return Ok(false);
@@ -759,11 +1013,13 @@ impl SearchIndex {
         file_reference_number: u64,
     ) -> Result<Option<NtfsNode>> {
         transaction
-            .query_row(
+            .prepare_cached(
                 "SELECT file_reference_number, parent_file_reference_number, relative_path,
                         name, is_directory, modified_unix_ms
                  FROM ntfs_nodes
                  WHERE root = ?1 AND file_reference_number = ?2",
+            )?
+            .query_row(
                 params![root, file_reference_number.to_string()],
                 ntfs_node_from_row,
             )
@@ -887,6 +1143,49 @@ impl SearchIndex {
                 node.modified_unix_ms,
                 generation,
                 &node.file_reference_number,
+            ])?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn upsert_snapshot_entry_if_changed(
+        transaction: &Transaction<'_>,
+        root: &str,
+        node: &NtfsNode,
+        generation: i64,
+    ) -> Result<()> {
+        let normalized_name = normalize_for_search(&node.name);
+        transaction
+            .prepare_cached(
+                "INSERT INTO entries (
+                 root, relative_path, name, normalized_name, normalized_path,
+                 is_directory, size_bytes, modified_unix_ms, generation, file_reference_number
+             ) VALUES (?1, ?2, ?3, ?4, ?4, ?5, 0, ?6, ?7, NULL)
+             ON CONFLICT(root, relative_path) DO UPDATE SET
+                 name = excluded.name,
+                 normalized_name = excluded.normalized_name,
+                 normalized_path = excluded.normalized_path,
+                 is_directory = excluded.is_directory,
+                 size_bytes = excluded.size_bytes,
+                 modified_unix_ms = excluded.modified_unix_ms,
+                 generation = excluded.generation,
+                 file_reference_number = NULL
+             WHERE entries.name IS NOT excluded.name
+                OR entries.normalized_name IS NOT excluded.normalized_name
+                OR entries.normalized_path IS NOT excluded.normalized_path
+                OR entries.is_directory IS NOT excluded.is_directory
+                OR entries.size_bytes IS NOT excluded.size_bytes
+                OR entries.modified_unix_ms IS NOT excluded.modified_unix_ms
+                OR entries.file_reference_number IS NOT NULL",
+            )?
+            .execute(params![
+                root,
+                &node.relative_path,
+                &node.name,
+                normalized_name,
+                i64::from(node.is_directory),
+                node.modified_unix_ms,
+                generation,
             ])?;
         Ok(())
     }
@@ -1023,6 +1322,12 @@ impl SearchIndex {
                  modified_unix_ms INTEGER,
                  PRIMARY KEY (root, file_reference_number),
                  FOREIGN KEY (root) REFERENCES roots(root) ON DELETE CASCADE
+             );
+
+             CREATE TABLE IF NOT EXISTS auto_volume_state (
+                 root TEXT PRIMARY KEY NOT NULL,
+                 last_reconcile_unix_ms INTEGER NOT NULL,
+                 uses_ntfs_usn INTEGER NOT NULL
              );",
         )?;
         ensure_column(&connection, "entries", "file_reference_number", "TEXT")?;
@@ -1034,7 +1339,9 @@ impl SearchIndex {
         )?;
         connection.execute_batch(
             "CREATE INDEX IF NOT EXISTS entries_ntfs_reference_idx
-             ON entries(root, file_reference_number);",
+             ON entries(root, file_reference_number);
+             CREATE INDEX IF NOT EXISTS ntfs_nodes_path_idx
+             ON ntfs_nodes(root, relative_path);",
         )?;
         Ok(())
     }
@@ -1310,6 +1617,25 @@ fn next_generation() -> i64 {
     }
 }
 
+/// 一个 USN 批次可能包含同一文件的成千上万次数据写入（索引数据库自身尤其
+/// 明显）。路径索引只关心批次结束时的名称、父节点和存在状态，因此每个文件
+/// 引用只保留 USN 最大的最后一条记录，避免自我写入放大。
+#[cfg(windows)]
+fn coalesce_ntfs_records(records: Vec<ntfs::UsnRecord>) -> Vec<ntfs::UsnRecord> {
+    let mut latest = HashMap::with_capacity(records.len().min(65_536));
+    for record in records {
+        latest
+            .entry(record.file_reference_number)
+            .and_modify(|existing: &mut ntfs::UsnRecord| {
+                if record.usn > existing.usn {
+                    *existing = record.clone();
+                }
+            })
+            .or_insert(record);
+    }
+    latest.into_values().collect()
+}
+
 fn system_time_to_ms(value: SystemTime) -> Option<i64> {
     value
         .duration_since(UNIX_EPOCH)
@@ -1327,6 +1653,43 @@ fn filetime_to_unix_ms(filetime: i64) -> Option<i64> {
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn search_rejects_unbounded_query_text_and_term_counts() {
+        let temporary = tempfile::tempdir().expect("创建临时目录");
+        let index = SearchIndex::open(temporary.path().join("index.db")).expect("打开索引");
+
+        let too_long = "金".repeat(MAX_QUERY_CHARS + 1);
+        assert!(matches!(
+            index.search(&SearchRequest::new(too_long)),
+            Err(SearchError::QueryTooLong)
+        ));
+
+        let too_many_terms = (0..=MAX_QUERY_TERMS)
+            .map(|index| format!("词{index}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(matches!(
+            index.search(&SearchRequest::new(too_many_terms)),
+            Err(SearchError::TooManyQueryTerms)
+        ));
+    }
+
+    #[test]
+    fn usn_batch_keeps_only_the_last_state_for_each_file_reference() {
+        let records = coalesce_ntfs_records(vec![
+            record(11, ntfs::ROOT_FILE_REFERENCE, 1, false, "旧名.tmp"),
+            record(12, ntfs::ROOT_FILE_REFERENCE, 2, false, "另一个.tmp"),
+            record(11, ntfs::ROOT_FILE_REFERENCE, 3, false, "新名.tmp"),
+        ]);
+        assert_eq!(records.len(), 2);
+        let latest = records
+            .iter()
+            .find(|record| record.file_reference_number == 11)
+            .unwrap();
+        assert_eq!(latest.usn, 3);
+        assert_eq!(latest.name, "新名.tmp");
+    }
 
     fn record(
         file_reference_number: u64,
@@ -1409,6 +1772,47 @@ mod tests {
     }
 
     #[test]
+    fn unresolved_usn_parent_marks_incomplete_without_requesting_a_rebuild_loop() {
+        let temporary = tempfile::tempdir().expect("创建临时目录");
+        let index = SearchIndex::open(temporary.path().join("index.db")).expect("打开索引");
+        let root = "C:/".to_owned();
+        index
+            .persist_ntfs_records(
+                root.clone(),
+                vec![record(10, ntfs::ROOT_FILE_REFERENCE, 1, false, "可靠.txt")],
+                7,
+                2,
+                Instant::now(),
+            )
+            .unwrap();
+
+        let fully_applied = index
+            .apply_ntfs_delta(
+                &root,
+                ntfs::JournalInfo {
+                    journal_id: 7,
+                    first_usn: 0,
+                    next_usn: 4,
+                },
+                4,
+                vec![record(12, 999, 3, false, "父链缺失.tmp")],
+            )
+            .unwrap();
+        assert!(!fully_applied);
+        let connection = index.connection().unwrap();
+        let next_usn = connection
+            .query_row(
+                "SELECT next_usn FROM ntfs_volume_state WHERE root = ?1",
+                [&root],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        assert_eq!(next_usn, "4");
+        assert!(!index.indexed_roots().unwrap()[0].complete);
+        assert_eq!(index.search(&SearchRequest::new("可靠")).unwrap().len(), 1);
+    }
+
+    #[test]
     fn incomplete_ntfs_snapshot_still_exposes_resolved_files() {
         let temporary = tempfile::tempdir().expect("创建临时目录");
         let index = SearchIndex::open(temporary.path().join("index.db")).expect("打开索引");
@@ -1428,6 +1832,11 @@ mod tests {
 
         assert!(!report.complete);
         assert_eq!(report.skipped_entries, 1);
+        let roots = index.indexed_roots().unwrap();
+        assert!(
+            roots[0].uses_ntfs_usn,
+            "少量孤立 MFT 记录不应让其余数百万条目失去 USN 增量维护"
+        );
         let matches = index.search(&SearchRequest::new("pdf 金福")).unwrap();
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].path, "C:/资料/金福验收.pdf");
@@ -1437,16 +1846,14 @@ mod tests {
     fn snapshot_without_an_active_journal_stays_searchable_without_a_sync_cursor() {
         let temporary = tempfile::tempdir().expect("创建临时目录");
         let index = SearchIndex::open(temporary.path().join("index.db")).expect("打开索引");
+        let snapshot_record = record(11, ntfs::ROOT_FILE_REFERENCE, 0, false, "无日志快照.pdf");
         let report = index
             .persist_ntfs_records(
                 "E:/".to_owned(),
-                vec![record(
-                    11,
-                    ntfs::ROOT_FILE_REFERENCE,
-                    0,
-                    false,
-                    "无日志快照.pdf",
-                )],
+                vec![
+                    snapshot_record.clone(),
+                    record(12, ntfs::ROOT_FILE_REFERENCE, 0, false, "即将删除.tmp"),
+                ],
                 0,
                 0,
                 Instant::now(),
@@ -1461,6 +1868,79 @@ mod tests {
         assert_eq!(
             index.search(&SearchRequest::new("pdf")).unwrap()[0].path,
             "E:/无日志快照.pdf"
+        );
+        let auto_states = index.auto_volume_states().unwrap();
+        assert_eq!(auto_states.len(), 1);
+        assert_eq!(auto_states[0].root, "E:/");
+        assert!(!auto_states[0].uses_ntfs_usn);
+
+        let generation_before = index
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT generation FROM entries WHERE root = 'E:/' AND relative_path = '无日志快照.pdf'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        index
+            .persist_ntfs_records(
+                "E:/".to_owned(),
+                vec![snapshot_record],
+                0,
+                0,
+                Instant::now(),
+            )
+            .expect("重复校准无日志快照");
+        let generation_after = index
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT generation FROM entries WHERE root = 'E:/' AND relative_path = '无日志快照.pdf'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(
+            generation_before, generation_after,
+            "未变化条目不应在每次校准时重写"
+        );
+        assert!(
+            index
+                .search(&SearchRequest::new("即将删除"))
+                .unwrap()
+                .is_empty(),
+            "重复快照仍应删除已经消失的条目"
+        );
+    }
+
+    #[test]
+    fn filesystem_notifications_add_and_remove_paths_without_a_full_rescan() {
+        let temporary = tempfile::tempdir().expect("创建临时目录");
+        let root = temporary.path().join("自动索引根");
+        fs::create_dir_all(&root).unwrap();
+        let index = SearchIndex::open(temporary.path().join("index.db")).expect("打开索引");
+        index.scan_root(&root).expect("建立空根索引");
+
+        let created = root.join("即时更新").join("金福自动报告.pdf");
+        fs::create_dir_all(created.parent().unwrap()).unwrap();
+        fs::write(&created, "metadata only").unwrap();
+        index
+            .refresh_changed_paths(&root, &[created.parent().unwrap().to_path_buf()])
+            .expect("合并创建事件");
+        let matches = index.search(&SearchRequest::new("自动 报告 pdf")).unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(PathBuf::from(&matches[0].path), created);
+
+        fs::remove_dir_all(created.parent().unwrap()).unwrap();
+        index
+            .refresh_changed_paths(&root, &[created.parent().unwrap().to_path_buf()])
+            .expect("合并删除事件");
+        assert!(
+            index
+                .search(&SearchRequest::new("金福自动报告"))
+                .unwrap()
+                .is_empty()
         );
     }
 }

@@ -24,6 +24,10 @@ struct Cli {
     #[arg(long, global = true)]
     database: Option<PathBuf>,
 
+    /// 仅供本机 MCP 适配器自动唤起托盘宿主，不显示初始搜索窗口。
+    #[arg(long, global = true, hide = true)]
+    background: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -79,12 +83,15 @@ enum Command {
     },
 }
 
-/// 无窗口的用户入口：只接受双击/无参数启动，避免 Windows 把它误用为 CLI。
+/// 无窗口的用户入口：双击显示搜索窗口；MCP 可用隐藏参数只启动托盘宿主。
 pub fn run_gui() -> ExitCode {
-    if std::env::args_os().nth(1).is_some() {
+    let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+    if !arguments.is_empty() && arguments.as_slice() != [std::ffi::OsString::from("--background")] {
         return show_gui_cli_usage();
     }
-    run(true)
+    // MCP 并发自启动时可能有一个后来者因管道已被占用而退出；后台模式不弹窗
+    // 打断用户，前台双击仍保留明确的错误对话框。
+    run(arguments.is_empty())
 }
 
 /// 供人和 Agent 适配器调用的控制台入口，保留稳定的 stdout JSON 协议。
@@ -116,7 +123,7 @@ fn run(show_dialogs: bool) -> ExitCode {
 
     let output = match cli.command {
         #[cfg(all(windows, feature = "tray"))]
-        None => tray::run(index, DEFAULT_PIPE_NAME.to_owned())
+        None => tray::run(index, DEFAULT_PIPE_NAME.to_owned(), !cli.background)
             .map(|_| json!({"stopped": true}))
             .map_err(tray_error),
         #[cfg(not(all(windows, feature = "tray")))]
@@ -209,7 +216,7 @@ fn run(show_dialogs: bool) -> ExitCode {
                 .map_err(pipe_error)
         }
         #[cfg(all(windows, feature = "tray"))]
-        Some(Command::Tray { pipe }) => tray::run(index, pipe)
+        Some(Command::Tray { pipe }) => tray::run(index, pipe, false)
             .map(|_| json!({"stopped": true}))
             .map_err(tray_error),
     };
@@ -352,5 +359,14 @@ mod tests {
     fn no_arguments_are_accepted_for_default_tray_startup() {
         let cli = Cli::try_parse_from(["jinfu-search-cli"]).expect("无参数应启动托盘而非报错退出");
         assert!(cli.command.is_none());
+        assert!(!cli.background);
+    }
+
+    #[test]
+    fn background_host_mode_is_available_for_the_mcp_adapter() {
+        let cli = Cli::try_parse_from(["jinfu-search", "--background"])
+            .expect("MCP 应能无窗口唤起托盘宿主");
+        assert!(cli.command.is_none());
+        assert!(cli.background);
     }
 }

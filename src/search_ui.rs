@@ -70,10 +70,10 @@ impl SearchPanelModel {
     fn idle_hint(&self) -> String {
         match self.index.status() {
             Ok(status) if status.roots == 0 => {
-                "还没有索引。点击“建立/更新本机索引”，完成后即可搜索。".to_owned()
+                "正在后台自动建立本机索引；无需操作，已完成的文件会陆续可搜索。".to_owned()
             }
             Ok(status) => format!(
-                "已索引 {} 个文件、{} 个目录；输入关键词后点击“搜索”。",
+                "后台自动维护中：已索引 {} 个文件、{} 个目录；输入关键词后点击“搜索”。",
                 status.indexed_files, status.indexed_directories
             ),
             Err(error) => format!("暂时无法读取索引状态：{error}"),
@@ -83,7 +83,7 @@ impl SearchPanelModel {
     fn empty_result_hint(&self, query: &str) -> String {
         match self.index.status() {
             Ok(status) if status.roots == 0 => {
-                "还没有索引。点击“建立/更新本机索引”，完成后即可搜索。".to_owned()
+                "正在后台自动建立本机索引；无需操作，请稍后再次搜索。".to_owned()
             }
             Ok(_) => format!("没有找到“{query}”；可换个名称关键词或扩展名。"),
             Err(error) => format!("没有找到“{query}”；索引状态读取失败：{error}"),
@@ -225,18 +225,18 @@ mod native {
         Graphics::Gdi::{DEFAULT_GUI_FONT, GetStockObject, HBRUSH, WHITE_BRUSH},
         System::LibraryLoader::GetModuleHandleW,
         UI::{
-            Input::KeyboardAndMouse::{EnableWindow, GetFocus, SetFocus, VK_RETURN},
+            Input::KeyboardAndMouse::{GetFocus, SetFocus, VK_RETURN},
             WindowsAndMessaging::{
                 BN_CLICKED, BS_DEFPUSHBUTTON, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
                 CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, ES_AUTOHSCROLL,
                 GWLP_USERDATA, GetClientRect, GetMessageW, GetWindowLongPtrW, GetWindowTextLengthW,
                 GetWindowTextW, IsDialogMessageW, LB_ADDSTRING, LB_ERR, LB_GETCURSEL,
                 LB_RESETCONTENT, LB_SETHORIZONTALEXTENT, LBN_DBLCLK, LBS_NOINTEGRALHEIGHT,
-                LBS_NOTIFY, MSG, MoveWindow, PostMessageW, PostQuitMessage, RegisterClassW,
-                SendMessageW, SetWindowLongPtrW, SetWindowTextW, TranslateMessage, WM_CLOSE,
-                WM_COMMAND, WM_CREATE, WM_DESTROY, WM_KEYDOWN, WM_NCCREATE, WM_NCDESTROY,
-                WM_SETFONT, WM_SIZE, WNDCLASSW, WS_BORDER, WS_CHILD, WS_EX_CLIENTEDGE,
-                WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+                LBS_NOTIFY, MSG, MoveWindow, PostQuitMessage, RegisterClassW, SendMessageW,
+                SetWindowLongPtrW, SetWindowTextW, TranslateMessage, WM_CLOSE, WM_COMMAND,
+                WM_CREATE, WM_DESTROY, WM_KEYDOWN, WM_NCCREATE, WM_NCDESTROY, WM_SETFONT, WM_SIZE,
+                WNDCLASSW, WS_BORDER, WS_CHILD, WS_EX_CLIENTEDGE, WS_OVERLAPPEDWINDOW, WS_TABSTOP,
+                WS_VISIBLE, WS_VSCROLL,
             },
         },
     };
@@ -252,8 +252,6 @@ mod native {
     const SEARCH_BUTTON_ID: i32 = 2;
     const RESULTS_ID: i32 = 3;
     const STATUS_ID: i32 = 4;
-    const INDEX_BUTTON_ID: i32 = 5;
-    const INDEX_FINISHED: u32 = 0x8000 + 42;
 
     pub fn run(index: SearchIndex, generation: u64) -> Result<(), String> {
         let class_name = wide(CLASS_NAME);
@@ -337,7 +335,6 @@ mod native {
         model: SearchPanelModel,
         input: HWND,
         button: HWND,
-        index_button: HWND,
         results: HWND,
         status: HWND,
         result_paths: Vec<std::path::PathBuf>,
@@ -349,7 +346,6 @@ mod native {
                 model: SearchPanelModel::new(index),
                 input: null_mut(),
                 button: null_mut(),
-                index_button: null_mut(),
                 results: null_mut(),
                 status: null_mut(),
                 result_paths: Vec::new(),
@@ -377,17 +373,6 @@ mod native {
                     0,
                     parent,
                     SEARCH_BUTTON_ID,
-                    instance,
-                )
-            };
-            self.index_button = unsafe {
-                create_control(
-                    "BUTTON",
-                    "建立/更新本机索引",
-                    WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                    0,
-                    parent,
-                    INDEX_BUTTON_ID,
                     instance,
                 )
             };
@@ -421,7 +406,6 @@ mod native {
             };
             if self.input.is_null()
                 || self.button.is_null()
-                || self.index_button.is_null()
                 || self.status.is_null()
                 || self.results.is_null()
             {
@@ -429,13 +413,7 @@ mod native {
             }
 
             let font = unsafe { GetStockObject(DEFAULT_GUI_FONT) };
-            for control in [
-                self.input,
-                self.button,
-                self.index_button,
-                self.status,
-                self.results,
-            ] {
+            for control in [self.input, self.button, self.status, self.results] {
                 unsafe {
                     SendMessageW(control, WM_SETFONT, font as usize, 1);
                 }
@@ -456,8 +434,7 @@ mod native {
             let height = (client.bottom - client.top).max(180);
             let padding = 14;
             let button_width = 90;
-            let index_width = 170;
-            let input_width = (width - padding * 4 - button_width - index_width).max(120);
+            let input_width = (width - padding * 3 - button_width).max(120);
             unsafe {
                 MoveWindow(self.input, padding, 30, input_width, 30, 1);
                 MoveWindow(
@@ -465,14 +442,6 @@ mod native {
                     padding * 2 + input_width,
                     30,
                     button_width,
-                    30,
-                    1,
-                );
-                MoveWindow(
-                    self.index_button,
-                    padding * 3 + input_width + button_width,
-                    30,
-                    index_width,
                     30,
                     1,
                 );
@@ -523,61 +492,6 @@ mod native {
                 reveal_path(path);
             }
         }
-
-        unsafe fn start_machine_index(&self, parent: HWND) {
-            unsafe {
-                EnableWindow(self.index_button, 0);
-                set_control_text(
-                    self.status,
-                    "正在索引本机固定磁盘，请保持程序运行；可继续使用电脑。",
-                );
-            }
-            let index = self.model.index.clone();
-            let parent = parent as isize;
-            std::thread::spawn(move || {
-                let volumes = crate::local_fixed_volumes();
-                let mut reports = Vec::new();
-                let mut failures = Vec::new();
-                for volume in volumes {
-                    let result = match index.scan_ntfs_volume(volume) {
-                        Ok(report) => Ok(report),
-                        Err(mft_error) => index
-                            .scan_root(format!("{volume}:\\"))
-                            .map_err(|scan_error| format!(
-                                "{volume}: MFT 索引失败（{mft_error}）；目录扫描也失败（{scan_error}）"
-                            )),
-                    };
-                    match result {
-                        Ok(report) => reports.push(report),
-                        Err(error) => failures.push(error),
-                    }
-                }
-                let files: u64 = reports.iter().map(|report| report.indexed_files).sum();
-                let directories: u64 = reports
-                    .iter()
-                    .map(|report| report.indexed_directories)
-                    .sum();
-                let message = if reports.is_empty() {
-                    format!("索引失败：{}", failures.join("；"))
-                } else if failures.is_empty() {
-                    format!(
-                        "索引完成：{files} 个文件、{directories} 个目录；现在可以搜索名称、扩展名或多个关键词。"
-                    )
-                } else {
-                    format!(
-                        "部分索引完成：{files} 个文件、{directories} 个目录；{}",
-                        failures.join("；")
-                    )
-                };
-                let message = Box::into_raw(Box::new(message));
-                if unsafe { PostMessageW(parent as HWND, INDEX_FINISHED, 0, message as isize) } == 0
-                {
-                    unsafe {
-                        drop(Box::from_raw(message));
-                    }
-                }
-            });
-        }
     }
 
     unsafe extern "system" fn window_proc(
@@ -612,10 +526,6 @@ mod native {
                         unsafe {
                             state.refresh_results();
                         }
-                    } else if control_id == INDEX_BUTTON_ID && notification == BN_CLICKED {
-                        unsafe {
-                            state.start_machine_index(hwnd);
-                        }
                     } else if control_id == RESULTS_ID && notification == LBN_DBLCLK {
                         unsafe {
                             state.reveal_selected_path();
@@ -646,16 +556,6 @@ mod native {
                 unsafe {
                     ShowWindow(hwnd, SW_RESTORE);
                     SetForegroundWindow(hwnd);
-                }
-                0
-            }
-            INDEX_FINISHED => {
-                let message = unsafe { Box::from_raw(lparam as *mut String) };
-                if let Some(state) = unsafe { state_mut(hwnd) } {
-                    unsafe {
-                        EnableWindow(state.index_button, 1);
-                        set_control_text(state.status, &message);
-                    }
                 }
                 0
             }
@@ -770,14 +670,14 @@ mod tests {
     use crate::SearchIndex;
 
     #[test]
-    fn empty_index_explains_that_the_user_must_create_an_index() {
+    fn empty_index_explains_that_automatic_indexing_is_in_progress() {
         let sandbox = tempdir().unwrap();
         let index = SearchIndex::open(sandbox.path().join("index.db")).unwrap();
 
         let view = SearchPanelModel::new(index).search("合同");
 
         assert!(view.rows.is_empty());
-        assert!(view.hint.contains("建立/更新本机索引"));
+        assert!(view.hint.contains("后台自动建立"));
     }
 
     #[test]

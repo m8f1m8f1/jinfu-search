@@ -16,7 +16,7 @@
 
 ## Agent API 是否有意义
 
-有意义，而且现有版本已经具备可用的 JSON-RPC 2.0 Named Pipe API。对 Agent 的主要价值不是“替用户再做一个搜索框”，而是：
+有意义。v0.3.0 已在 JSON-RPC 2.0 Named Pipe API 之上提供标准 STDIO MCP 适配器。对 Agent 的主要价值不是“替用户再做一个搜索框”，而是：
 
 1. 在数百万条目中以结构化 JSON 快速定位候选文件，避免 Agent 递归遍历所有磁盘。
 2. 先返回路径、类型、大小和修改时间等元数据，再由 Agent 在得到任务授权后只读取少数目标文件，减少隐私暴露与工具调用。
@@ -27,11 +27,11 @@
 
 - 默认暴露只读工具：`search.query`、`status.get`、`index.list_roots`。
 - `index.scan_root`、`index.scan_volume`、`index.sync_volume`、`index.remove_root` 和 `app.shutdown` 属于会改变状态或可能耗时的管理能力，不应让 Agent 在模糊请求下自动调用。
-- 下一步若要接入 Codex、Claude Desktop 等 MCP 客户端，做一个很薄的 MCP 适配器即可复用现有 Named Pipe；不应在主 EXE 中加入 HTTP 服务，也不需要让模型读取整个索引数据库。
+- `jinfu-search-mcp.exe` 已把三个默认只读能力暴露给 Codex 等 MCP 客户端，并复用现有 Named Pipe；主 EXE 不加入 HTTP 服务，模型也不直接读取整个索引数据库。
 
 ## 推荐优先级
 
 1. 保持当前轻量文件名搜索内核，不改造成重型全文引擎。
 2. 下一功能优先补高级查询过滤（文件/目录、扩展名、大小、日期、根目录）与结果分页；这同时改善人工和 Agent 使用。
-3. 再做只读优先的 MCP 适配器，并把索引管理工具标记为显式确认操作。
+3. 保持 MCP 适配器只读；索引管理继续留在人工 CLI/底层受控接口，不进入默认 Agent 工具。
 4. 正文/OCR/语义搜索应作为可选的独立索引层，不进入默认单文件核心。
