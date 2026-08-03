@@ -2,6 +2,8 @@
 
 Windows 优先的 Rust 本地文件搜索服务：首次整卷索引读取 NTFS MFT 元数据，后续通过 USN Journal 做增量更新；默认不读取、不保存文件正文。
 
+`v0.2.0` 的 GUI 成品是 x64 Windows 10/11 单文件绿色版：Rust、SQLite 和 MSVC CRT 均静态链接，不需要安装 Rust、SQLite DLL 或 Microsoft Visual C++ Redistributable。程序仍会按正常应用惯例在 `%LOCALAPPDATA%\JinfuSearch\index.db` 创建本机索引数据；该数据库是运行数据，不是随 EXE 搬运的依赖。
+
 ## 当前能力
 
 - 搜索文件和目录名称，支持 Unicode 大小写无关匹配、扩展名优先和空格分隔的多个名称相关词；路径文本也可作为辅助匹配条件，但不承诺完整的 Unicode 大小写折叠。
@@ -23,6 +25,8 @@ cargo build --release
 
 - `target\release\jinfu-search.exe`：无窗口的托盘宿主，供直接双击启动。
 - `target\release\jinfu-search-cli.exe`：控制台与 Agent 适配器，输出稳定的 JSON。
+
+仓库的 `.cargo/config.toml` 为 `x86_64-pc-windows-msvc` 启用静态 CRT，因此只复制 `jinfu-search.exe` 就能使用图形搜索。CLI 仅在脚本或 Agent 需要现成的 JSON/Named Pipe 适配器时使用，不是 GUI 的运行依赖。Windows 自带的 `kernel32.dll`、`user32.dll` 等系统组件仍由操作系统提供。
 
 直接双击 `jinfu-search.exe` 会启动系统托盘驻留并打开搜索窗口（不会自动扫描任何磁盘，也不会弹出空白控制台）。关闭搜索窗口只会回到托盘待命；图标可能位于时钟旁的 `^` 隐藏图标区。右键图标可再次打开搜索窗口、建立 C: 索引、刷新、同步或退出。启动失败会显示明确的 Windows 错误提示。
 需要脚本、终端或 Agent 适配器操作时，使用 `jinfu-search-cli.exe`。
@@ -123,3 +127,4 @@ $pipe = "\\.\pipe\jinfu-search-$([guid]::NewGuid().ToString('N'))"
 - NTFS MFT/USN 路径适用于 Windows NTFS。FAT、exFAT、网络盘和不具备卷访问权限的场景使用 `index <目录>` 回退扫描。
 - 初次全卷快照和日志换代后的重建可能需要较高的卷访问权限；请由用户或受信任 Agent 显式触发。
 - 当前路径树按单个 NTFS 文件引用号维护，不把硬链接的每一条目录项展开为多条结果；这是下一阶段应补齐的 NTFS 语义。
+- 同类开源项目与 Agent API 的阶段性评估见 [`docs/stage-2-evaluation.md`](docs/stage-2-evaluation.md)。
