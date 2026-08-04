@@ -234,9 +234,9 @@ mod native {
                 LB_ADDSTRING, LB_ERR, LB_GETCURSEL, LB_RESETCONTENT, LB_SETHORIZONTALEXTENT,
                 LBN_DBLCLK, LBS_NOINTEGRALHEIGHT, LBS_NOTIFY, MSG, MoveWindow, PostQuitMessage,
                 RegisterClassW, SendMessageW, SetWindowLongPtrW, SetWindowTextW, TranslateMessage,
-                WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_KEYDOWN, WM_NCCREATE,
-                WM_NCDESTROY, WM_SETFONT, WM_SIZE, WNDCLASSW, WS_BORDER, WS_CHILD,
-                WS_EX_CLIENTEDGE, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+                WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_KEYDOWN, WM_NCCREATE, WM_NCDESTROY,
+                WM_SETFONT, WM_SIZE, WNDCLASSW, WS_BORDER, WS_CHILD, WS_EX_CLIENTEDGE,
+                WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
             },
         },
     };
@@ -264,11 +264,11 @@ mod native {
                 CreateIconFromResourceEx(
                     bytes.as_ptr(),
                     bytes.len() as u32,
-                    1,          // fIcon
+                    1,           // fIcon
                     0x0003_0000, // dwVer: Windows 3.0+ 图标格式
-                    0,          // cxDesired: 系统默认
-                    0,          // cyDesired
-                    0,          // flags
+                    0,           // cxDesired: 系统默认
+                    0,           // cyDesired
+                    0,           // flags
                 ) as usize
             }
         });
