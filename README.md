@@ -1,5 +1,9 @@
 # 金福搜索（Jinfu Search）
 
+<p align="center">
+  <img src="assets/icon-512.png" alt="金福搜索" width="120">
+</p>
+
 一个面向 Windows 的轻量本机文件名搜索器。双击即用，自动维护索引，也可通过只读 MCP 工具供本地 Agent 搜索文件位置。
 
 > Windows-first local filename search with automatic indexing and a read-only MCP adapter for local agents.

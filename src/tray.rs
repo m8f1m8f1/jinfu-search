@@ -145,17 +145,6 @@ fn status_label(index: &SearchIndex) -> String {
 }
 
 fn status_icon() -> Result<Icon, tray_icon::BadIcon> {
-    const SIZE: u32 = 16;
-    let mut rgba = vec![0_u8; (SIZE * SIZE * 4) as usize];
-    for y in 0..SIZE {
-        for x in 0..SIZE {
-            let index = ((y * SIZE + x) * 4) as usize;
-            let edge = x == 0 || y == 0 || x == SIZE - 1 || y == SIZE - 1;
-            rgba[index] = if edge { 17 } else { 12 };
-            rgba[index + 1] = if edge { 110 } else { 155 };
-            rgba[index + 2] = if edge { 158 } else { 214 };
-            rgba[index + 3] = 255;
-        }
-    }
-    Icon::from_rgba(rgba, SIZE, SIZE)
+    // 32x32 高清图标（tools/generate_icon.py 生成并内嵌），Windows 托盘按需缩放。
+    Icon::from_rgba(crate::icon_data::TRAY_ICON_32.to_vec(), 32, 32)
 }

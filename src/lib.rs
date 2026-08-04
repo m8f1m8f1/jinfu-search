@@ -43,6 +43,9 @@ pub mod search_ui;
 #[cfg(all(windows, feature = "tray"))]
 pub mod tray;
 
+#[cfg(all(windows, feature = "tray"))]
+mod icon_data;
+
 const MAX_QUERY_LIMIT: usize = 1_000;
 const MAX_QUERY_CHARS: usize = 512;
 const MAX_QUERY_TERMS: usize = 16;

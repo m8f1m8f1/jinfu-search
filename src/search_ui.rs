@@ -228,15 +228,15 @@ mod native {
             Input::KeyboardAndMouse::{GetFocus, SetFocus, VK_RETURN},
             WindowsAndMessaging::{
                 BN_CLICKED, BS_DEFPUSHBUTTON, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
-                CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, ES_AUTOHSCROLL,
-                GWLP_USERDATA, GetClientRect, GetMessageW, GetWindowLongPtrW, GetWindowTextLengthW,
-                GetWindowTextW, IsDialogMessageW, LB_ADDSTRING, LB_ERR, LB_GETCURSEL,
-                LB_RESETCONTENT, LB_SETHORIZONTALEXTENT, LBN_DBLCLK, LBS_NOINTEGRALHEIGHT,
-                LBS_NOTIFY, MSG, MoveWindow, PostQuitMessage, RegisterClassW, SendMessageW,
-                SetWindowLongPtrW, SetWindowTextW, TranslateMessage, WM_CLOSE, WM_COMMAND,
-                WM_CREATE, WM_DESTROY, WM_KEYDOWN, WM_NCCREATE, WM_NCDESTROY, WM_SETFONT, WM_SIZE,
-                WNDCLASSW, WS_BORDER, WS_CHILD, WS_EX_CLIENTEDGE, WS_OVERLAPPEDWINDOW, WS_TABSTOP,
-                WS_VISIBLE, WS_VSCROLL,
+                CreateIconFromResourceEx, CreateWindowExW, DefWindowProcW, DestroyWindow,
+                DispatchMessageW, ES_AUTOHSCROLL, GWLP_USERDATA, GetClientRect, GetMessageW,
+                GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW, IsDialogMessageW,
+                LB_ADDSTRING, LB_ERR, LB_GETCURSEL, LB_RESETCONTENT, LB_SETHORIZONTALEXTENT,
+                LBN_DBLCLK, LBS_NOINTEGRALHEIGHT, LBS_NOTIFY, MSG, MoveWindow, PostQuitMessage,
+                RegisterClassW, SendMessageW, SetWindowLongPtrW, SetWindowTextW, TranslateMessage,
+                WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_KEYDOWN, WM_NCCREATE,
+                WM_NCDESTROY, WM_SETFONT, WM_SIZE, WNDCLASSW, WS_BORDER, WS_CHILD,
+                WS_EX_CLIENTEDGE, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
             },
         },
     };
@@ -253,6 +253,28 @@ mod native {
     const RESULTS_ID: i32 = 3;
     const STATUS_ID: i32 = 4;
 
+    /// 从内嵌的 assets/icon.ico 创建窗口类图标（标题栏与任务栏共用）。
+    /// 进程生命周期内只创建一次；由系统在进程退出时统一回收。
+    fn class_icon() -> windows_sys::Win32::UI::WindowsAndMessaging::HICON {
+        use std::sync::OnceLock;
+        static ICON: OnceLock<usize> = OnceLock::new();
+        let handle = *ICON.get_or_init(|| {
+            let bytes = include_bytes!("../assets/icon.ico");
+            unsafe {
+                CreateIconFromResourceEx(
+                    bytes.as_ptr(),
+                    bytes.len() as u32,
+                    1,          // fIcon
+                    0x0003_0000, // dwVer: Windows 3.0+ 图标格式
+                    0,          // cxDesired: 系统默认
+                    0,          // cyDesired
+                    0,          // flags
+                ) as usize
+            }
+        });
+        handle as *mut core::ffi::c_void
+    }
+
     pub fn run(index: SearchIndex, generation: u64) -> Result<(), String> {
         let class_name = wide(CLASS_NAME);
         let title = wide(WINDOW_TITLE);
@@ -261,6 +283,7 @@ mod native {
             style: CS_HREDRAW | CS_VREDRAW,
             lpfnWndProc: Some(window_proc),
             hInstance: instance,
+            hIcon: class_icon(),
             hbrBackground: unsafe { GetStockObject(WHITE_BRUSH) } as HBRUSH,
             lpszClassName: class_name.as_ptr(),
             ..unsafe { zeroed() }
