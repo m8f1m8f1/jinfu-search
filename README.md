@@ -8,6 +8,16 @@
 
 > Windows-first local filename search with automatic indexing and a read-only MCP adapter for local agents.
 
+<p align="center">
+  <img src="https://img.shields.io/github/actions/workflow/status/m8f1m8f1/jinfu-search/ci.yml?branch=master&label=CI" alt="CI">
+  <img src="https://img.shields.io/github/v/release/m8f1m8f1/jinfu-search?label=Release" alt="Release">
+  <img src="https://img.shields.io/github/license/m8f1m8f1/jinfu-search" alt="License">
+  <img src="https://img.shields.io/badge/platform-Windows-blue" alt="Platform">
+  <img src="https://img.shields.io/github/downloads/m8f1m8f1/jinfu-search/total" alt="Downloads">
+</p>
+
+
+
 ## 特点
 
 - **自动索引**：无需按钮。首次启动自动识别固定磁盘并建立索引，之后持续维护。
